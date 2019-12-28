@@ -297,3 +297,67 @@ void cbf_close(cbf_t *cbf)
 	}
 }
 
+uint32_t cbf_get_num_files(cbf_t *cbf)
+{
+	if (!cbf)
+		return 0u;
+
+	return cbf->file_num;
+}
+
+const char *cbf_get_name(cbf_t *cbf, uint32_t index)
+{
+	if (!cbf || index >= cbf->file_num)
+		return NULL;
+
+	return (const char *) cbf->file_descs[index].name;
+}
+
+int cbf_get_index(cbf_t *cbf, const char *name, uint32_t *index)
+{
+	uint32_t f_id;
+	const char *f_name;
+
+	if (!cbf || !name || !index)
+		return 1;
+
+	for (f_id = 0; f_id < cbf->file_num; f_id++) {
+		f_name = cbf_get_name(cbf, f_id);
+		if (strcmp(name, f_name) == 0) {
+			*index = f_id;
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
+cbf_file_t *cbf_fopen(cbf_t *cbf, const char *name)
+{
+	uint32_t index;
+
+	if (cbf_get_index(cbf, name, &index))
+		return NULL;
+
+	return cbf_fopen_index(cbf, index);
+}
+
+cbf_file_t *cbf_fopen_index(cbf_t *cbf, uint32_t index)
+{
+	cbf_file_t *file;
+
+	if (!cbf || index >= cbf->file_num)
+		return NULL;
+
+	file = &cbf->file_descs[index];
+	file->cur_ptr = 0u;
+
+	return file;
+}
+
+
+void cbf_fclose(cbf_file_t *file)
+{
+	return;
+}
+
