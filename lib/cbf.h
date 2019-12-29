@@ -30,6 +30,9 @@ int         cbf_get_index(cbf_t *cbf, const char *name, uint32_t *index);
 
 cbf_file_t *cbf_fopen(cbf_t *cbf, const char *name);
 cbf_file_t *cbf_fopen_index(cbf_t *cbf, uint32_t index);
+size_t      cbf_fread(void *ptr, size_t bytes, cbf_file_t *file);
+int         cbf_fseek(cbf_file_t *file, uint32_t offset);
+int         cbf_ftell(cbf_file_t *file, uint32_t *offset);
 void        cbf_fclose(cbf_file_t *file);
 
 #ifdef __cplusplus

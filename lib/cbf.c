@@ -29,6 +29,8 @@ const uint8_t cbf_file_desc_lut[] = {
 	0xA3, 0x44, 0x21, 0xB4,
 };
 
+const uint8_t cbf_file_salt = 0xA6;
+
 struct CBF_Header {
 	char signature[sizeof(cbf_sig)];
 	uint32_t archive_size;
@@ -235,6 +237,12 @@ static int cbf_load_file_descs(cbf_t *cbf)
 	return 0;
 }
 
+static void cbf_decrypt_file(uint8_t *ptr, size_t bytes, uint8_t key)
+{
+	for (size_t pos = 0; pos < bytes; pos++)
+		ptr[pos] = (ptr[pos] + cbf_file_salt + key) ^ key;
+}
+
 cbf_t *cbf_open(const char *path)
 {
 	cbf_t *cbf;
@@ -352,9 +360,53 @@ cbf_file_t *cbf_fopen_index(cbf_t *cbf, uint32_t index)
 	file = &cbf->file_descs[index];
 	file->cur_ptr = 0u;
 
-	return file;
+	return (file->encoding == CBF_ENC_ENCRYPTION) ? file : NULL;
 }
 
+size_t cbf_fread(void *ptr, size_t bytes, cbf_file_t *file)
+{
+	cbf_t *cbf;
+	size_t bytes_max;
+	size_t ret;
+
+	if (ptr == NULL || file == NULL ||
+	    file->cbf == NULL || file->cbf->f == NULL)
+		return 0;
+
+	cbf = file->cbf;
+
+	if (fseek(cbf->f, file->offset + file->cur_ptr, SEEK_SET) == -1)
+		return 0;
+
+	bytes_max = file->size - file->cur_ptr;
+	ret = fread(ptr, 1, (bytes > bytes_max) ? bytes_max : bytes, cbf->f);
+	file->cur_ptr += ret;
+
+	if (file->encoding == CBF_ENC_ENCRYPTION)
+		cbf_decrypt_file((uint8_t *) ptr, ret, file->size);
+
+	return ret;
+}
+
+int cbf_fseek(cbf_file_t *file, uint32_t offset)
+{
+	if (!file || offset > file->size)
+		return -1;
+
+	file->cur_ptr = offset;
+
+	return 0;
+}
+
+int cbf_ftell(cbf_file_t *file, uint32_t *offset)
+{
+	if (!file)
+		return -1;
+
+	*offset = file->cur_ptr;
+
+	return 0;
+}
 
 void cbf_fclose(cbf_file_t *file)
 {
