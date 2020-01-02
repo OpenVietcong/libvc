@@ -17,6 +17,11 @@ enum {
 	CBF_ENC_COMPRESSION = 1,
 };
 
+enum {
+	CBF_MOD_CLASSIC  = 0,
+	CBF_MOD_EXTENDED = 1,
+};
+
 const char cbf_sig[] = {
 	0x42, 0x49, 0x47, 0x46,	/* BIGF  */
 	0x01, 0x5A, 0x42, 0x4C, /* \1ZBL */
@@ -40,7 +45,7 @@ struct CBF_Header {
 	uint32_t res2;
 	uint32_t table_size;
 	uint32_t res3;
-	uint32_t unk1;
+	uint32_t header_size;
 	uint32_t res4;
 	uint32_t date_low;
 	uint32_t date_high;
@@ -73,25 +78,69 @@ struct cbf_file {
 
 /* CBF archive data */
 struct cbf {
+	uint32_t mode;		/* CBF mode */
 	uint32_t a_size;	/* Total archive size */
 	uint32_t t_offset;	/* Table offset */
 	uint32_t t_size;	/* Table size */
 	uint32_t file_num;
 	cbf_file_t *file_descs;
 	FILE *f;
+	char *comment;
 };
+
+static int cbf_parse_comment(cbf_t *cbf, uint32_t header_size)
+{
+	uint32_t comment_len;
+	uint16_t label;
+
+	/* Get comment label */
+	if (fread(&label, sizeof(label), 1, cbf->f) != 1) {
+		fprintf(stderr, "Unable to read comment label\n");
+		return 1;
+	}
+	if (label != 1) {
+		fprintf(stderr, "Invalid comment label\n");
+		return 1;
+	}
+
+	/* Get comment length */
+	if (fread(&comment_len, sizeof(comment_len), 1, cbf->f) != 1) {
+		fprintf(stderr, "Unable to read comment size\n");;
+		return 1;
+	}
+	if (header_size != 70u + (uint32_t) comment_len) {
+		fprintf(stderr, "Comment does not fit the header\n");
+		return 1;
+	}
+
+	/* Get comment itself */
+	if ((cbf->comment = (char *) malloc(comment_len + 1)) == NULL) {
+		fprintf(stderr, "Unable to malloc mem\n");
+		return 1;
+	}
+	if (fread(cbf->comment, comment_len, 1, cbf->f) != 1) {
+		fprintf(stderr, "Unable to read comment\n");
+		free(cbf->comment);
+		cbf->comment = NULL;
+		return 1;
+	}
+	cbf->comment[comment_len] = '\0'; /* sic! */
+
+	return 0;
+}
 
 static int cbf_parse_header(cbf_t *cbf)
 {
 	struct CBF_Header header;
 	long file_size;
+	uint32_t res[3];
 
 	/* Read header */
 	if (fseek(cbf->f, 0, SEEK_SET) == -1) {
 		fprintf(stderr, "Unable to move file cursor\n");
 		return 1;
 	}
-	if ((fread(&header, sizeof(header), 1, cbf->f)) != 1) {
+	if (fread(&header, sizeof(header), 1, cbf->f) != 1) {
 		fprintf(stderr, "Unable to read CBF header\n");
 		return 1;
 	}
@@ -112,6 +161,30 @@ static int cbf_parse_header(cbf_t *cbf)
 		fprintf(stderr, "Found non-zero reserved fields in header\n");
 	}
 
+	if (header.header_size != 0u) {
+		if (header.header_size < 64u) {
+			fprintf(stderr, "Invalid size of CBF header: %u\n",
+				header.header_size);
+			return 1;
+		}
+
+		if (fread(res, sizeof(res), 1, cbf->f) != 1) {
+			fprintf(stderr, "Unable to read reserved fields\n");
+			return 1;
+		}
+		if (res[0] != 0u || res[1] != 0u || res[2] != 0u)
+			fprintf(stderr, "Found non-zero reserved fields");
+
+		if (header.header_size > 70u) {
+			if (cbf_parse_comment(cbf, header.header_size))
+				return 1;
+		} else if (header.header_size > 64u) {
+			fprintf(stderr, "Invalid header size: %u\n",
+				header.header_size);
+			return 1;
+		}
+	}
+
 	/* Check for file size consistency */
 	if (fseek(cbf->f, 0, SEEK_END) == -1)
 		fprintf(stderr, "Unable to move file cursor\n");
@@ -121,6 +194,8 @@ static int cbf_parse_header(cbf_t *cbf)
 		fprintf(stderr, "Incorrect archive size (%ld vs %u)\n",
 			file_size, header.archive_size);
 
+	cbf->mode     = (header.header_size) ? CBF_MOD_EXTENDED :
+					       CBF_MOD_CLASSIC;
 	cbf->a_size   = header.archive_size;
 	cbf->file_num = header.file_count;
 	cbf->t_offset = header.table_offset;
@@ -218,6 +293,12 @@ static int cbf_load_file_descs(cbf_t *cbf)
 		if (cbf_parse_file_desc(cbf_file, data, desc_size))
 			break;
 
+		if (cbf->mode == CBF_MOD_CLASSIC &&
+		    (data->unk1 != 0 || data->date_low != 0 ||
+		    data->date_high != 0)) {
+			fprintf(stderr, "Found non-zero reserved fields\n");
+		}
+
 		cbf_file->cbf = cbf;
 
 	}
@@ -298,6 +379,8 @@ void cbf_close(cbf_t *cbf)
 			free(cbf->file_descs);
 		}
 
+		if (cbf->comment)
+			free(cbf->comment);
 		if (cbf->f)
 			fclose(cbf->f);
 
