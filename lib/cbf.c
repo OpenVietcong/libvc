@@ -80,6 +80,7 @@ struct cbf_file {
 struct cbf {
 	uint32_t mode;		/* CBF mode */
 	uint32_t a_size;	/* Total archive size */
+	uint32_t h_size;	/* Header size */
 	uint32_t t_offset;	/* Table offset */
 	uint32_t t_size;	/* Table size */
 	uint32_t file_num;
@@ -197,6 +198,7 @@ static int cbf_parse_header(cbf_t *cbf)
 	cbf->mode     = (header.header_size) ? CBF_MOD_EXTENDED :
 					       CBF_MOD_CLASSIC;
 	cbf->a_size   = header.archive_size;
+	cbf->h_size   = (header.header_size) ? header.header_size : 52u;
 	cbf->file_num = header.file_count;
 	cbf->t_offset = header.table_offset;
 	cbf->t_size   = header.table_size;
@@ -251,6 +253,7 @@ static int cbf_parse_file_desc(cbf_file_t *cbf_file, struct CBF_File *data,
 static int cbf_load_file_descs(cbf_t *cbf)
 {
 	struct CBF_File *data = NULL;
+	size_t total_size = cbf->h_size;
 	uint32_t read_size = 0;
 	uint32_t file_cnt;
 	uint16_t prev_desc_size = 0;
@@ -299,9 +302,11 @@ static int cbf_load_file_descs(cbf_t *cbf)
 			fprintf(stderr, "Found non-zero reserved fields\n");
 		}
 
+		total_size += (cbf_file->encoding) ? cbf_file->comp_size :
+						     cbf_file->size;
 		cbf_file->cbf = cbf;
-
 	}
+	total_size += read_size;
 
 	if (file_cnt != cbf->file_num) {
 		fprintf(stderr, "Found only %u/%u valid file descriptors\n",
@@ -310,6 +315,8 @@ static int cbf_load_file_descs(cbf_t *cbf)
 	}
 	else if (read_size != cbf->t_size) {
 		fprintf(stderr, "Incorrect file descriptor table size\n");
+	} else if (total_size != cbf->a_size) {
+		fprintf(stderr, "Incorrect archive size\n");
 	}
 
 	if (data)
