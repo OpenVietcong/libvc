@@ -13,8 +13,9 @@
 #include "cbf.h"
 
 enum {
-	CBF_ENC_ENCRYPTION  = 0,
-	CBF_ENC_COMPRESSION = 1,
+	CBF_VER_ZBL0 = 0,
+	CBF_VER_ZBL1 = 1,
+	CBF_VER_CNT,
 };
 
 enum {
@@ -22,9 +23,18 @@ enum {
 	CBF_MOD_EXTENDED = 1,
 };
 
+enum {
+	CBF_ENC_NOCOMPRESS  = 0,
+	CBF_ENC_COMPRESSION = 1,
+};
+
 const char cbf_sig[] = {
-	0x42, 0x49, 0x47, 0x46,	/* BIGF  */
-	0x01, 0x5A, 0x42, 0x4C, /* \1ZBL */
+	0x42, 0x49, 0x47, 0x46,	/* BIGF */
+};
+
+const char cbf_vers[][4] = {
+	{ 0x00, 0x5A, 0x42, 0x4C }, /* \0ZBL */
+	{ 0x01, 0x5A, 0x42, 0x4C }, /* \1ZBL */
 };
 
 const uint8_t cbf_file_desc_lut[] = {
@@ -38,6 +48,7 @@ const uint8_t cbf_file_salt = 0xA6;
 
 struct CBF_Header {
 	char signature[sizeof(cbf_sig)];
+	char version[4];
 	uint32_t archive_size;
 	uint32_t res1;
 	uint32_t file_count;
@@ -78,6 +89,7 @@ struct cbf_file {
 
 /* CBF archive data */
 struct cbf {
+	uint32_t ver;		/* CBF version */
 	uint32_t mode;		/* CBF mode */
 	uint32_t a_size;	/* Total archive size */
 	uint32_t h_size;	/* Header size */
@@ -135,6 +147,7 @@ static int cbf_parse_header(cbf_t *cbf)
 	struct CBF_Header header;
 	long file_size;
 	uint32_t res[3];
+	uint32_t ver;
 
 	/* Read header */
 	if (fseek(cbf->f, 0, SEEK_SET) == -1) {
@@ -149,6 +162,14 @@ static int cbf_parse_header(cbf_t *cbf)
 		fprintf(stderr, "Not a CBF file\n");
 		return 1;
 	}
+	for (ver = 0; ver < CBF_VER_CNT; ver++) {
+		if (!memcmp(&header.version, cbf_vers[ver], 4))
+			break;
+	}
+	if (ver == CBF_VER_CNT) {
+		fprintf(stderr, "Unknown CBF version\n");
+		return 1;
+	}
 
 	if (header.table_offset < sizeof(struct CBF_Header) ||
 	    header.table_offset > (header.archive_size - header.table_size) ||
@@ -160,6 +181,11 @@ static int cbf_parse_header(cbf_t *cbf)
 	if (header.res1 != 0u || header.res2 != 0u ||
 	    header.res3 != 0u || header.res4 != 0u) {
 		fprintf(stderr, "Found non-zero reserved fields in header\n");
+	}
+
+	if (ver == CBF_VER_ZBL0 && header.header_size != 64u) {
+		fprintf(stderr, "Invalid header size for ZBL0\n");
+		return 1;
 	}
 
 	if (header.header_size != 0u) {
@@ -195,8 +221,14 @@ static int cbf_parse_header(cbf_t *cbf)
 		fprintf(stderr, "Incorrect archive size (%ld vs %u)\n",
 			file_size, header.archive_size);
 
+	cbf->ver      = ver;
 	cbf->mode     = (header.header_size) ? CBF_MOD_EXTENDED :
 					       CBF_MOD_CLASSIC;
+	if (cbf->mode == CBF_MOD_CLASSIC)
+		printf("classic\n");
+	else
+		printf("extended\n");
+	printf("%x %x\n", header.date_low, header.date_high);
 	cbf->a_size   = header.archive_size;
 	cbf->h_size   = (header.header_size) ? header.header_size : 52u;
 	cbf->file_num = header.file_count;
@@ -206,7 +238,7 @@ static int cbf_parse_header(cbf_t *cbf)
 	return 0;
 }
 
-static void cbf_decrypt_file_desc(uint8_t *ptr, size_t bytes, uint8_t key)
+static uint8_t cbf_decrypt_file_desc(uint8_t *ptr, size_t bytes, uint8_t key)
 {
 	uint8_t enc_byte;
 
@@ -215,112 +247,130 @@ static void cbf_decrypt_file_desc(uint8_t *ptr, size_t bytes, uint8_t key)
 		ptr[pos] = enc_byte ^ cbf_file_desc_lut[key & 0x0F];
 		key = enc_byte;
 	}
+
+	return key;
 }
 
-static int cbf_parse_file_desc(cbf_file_t *cbf_file, struct CBF_File *data,
-			       size_t bytes)
+static int cbf_parse_file_desc(cbf_file_t *cbf_file, uint8_t *file_table,
+			       uint32_t t_size, size_t *t_pos)
 {
-	size_t name_len = bytes - sizeof(struct CBF_File);
-	uint8_t key = bytes & 0xFF;
+	uint16_t *desc_size = NULL;
+	struct CBF_File *file_desc = NULL;
+	cbf_t *cbf = cbf_file->cbf;
+	char *p_char;
+	size_t name_len;
+	uint8_t key;
 
-	cbf_decrypt_file_desc((uint8_t *) data, bytes, key);
+	if (cbf->ver == CBF_VER_ZBL1) {
+		if (t_size < *t_pos + sizeof(*desc_size))
+			return 1;
+		desc_size = (uint16_t *) (file_table + *t_pos);
+		*t_pos += sizeof(*desc_size);
+	}
 
-	if (data->res1 != 0u || data->res2 != 0u) {
+	if (t_size < *t_pos + sizeof(*file_desc))
+		return 1;
+	file_desc = (struct CBF_File *) (file_table + *t_pos);
+	*t_pos += sizeof(*file_desc);
+
+	if (cbf->ver == CBF_VER_ZBL1) {
+		key = *desc_size & 0xFFu;
+		key = cbf_decrypt_file_desc((uint8_t *) file_desc,
+					    sizeof(*file_desc), key);
+	}
+
+	if (file_desc->res1 != 0u || file_desc->res2 != 0u) {
 		fprintf(stderr, "Unexpected data in file descriptor\n");
 	}
 
-	if (data->encoding != CBF_ENC_ENCRYPTION &&
-	    data->encoding != CBF_ENC_COMPRESSION) {
+	if (file_desc->encoding != CBF_ENC_NOCOMPRESS &&
+	    file_desc->encoding != CBF_ENC_COMPRESSION) {
 		fprintf(stderr, "Unknown encoding method\n");
-		return -1;
+		return 1;
 	}
 
+	//printf("mode: %s, %x %x\n", (cbf->mode == CBF_MOD_CLASSIC) ? "classic" : "extended", file_desc->unk1, file_desc->unk2);
+	if (cbf->mode == CBF_MOD_CLASSIC &&
+	    (file_desc->unk1 != 0 || file_desc->date_low != 0 ||
+	    file_desc->date_high != 0)) {
+		fprintf(stderr, "Found non-zero reserved fields\n");
+	}
+	if (cbf->ver == CBF_VER_ZBL0) {
+		if ((p_char = (char *)memchr(file_table + *t_pos, '\0',
+				     t_size - *t_pos)) == NULL) {
+			fprintf(stderr, "Invalid file name\n");
+			return 1;
+		} else {
+			name_len = p_char - (char *) file_table + *t_pos;
+		}
+	} else {
+		name_len = (size_t) *desc_size - sizeof(struct CBF_File);
+	}
 	if ((cbf_file->name = (char *) malloc(name_len)) == NULL) {
 		fprintf(stderr, "Unable to malloc mem\n");
-		return -1;
+		return 1;
+	}
+	memcpy(cbf_file->name, file_table + *t_pos, name_len);
+	*t_pos += name_len;
+	if (cbf->ver == CBF_VER_ZBL1) {
+		key = cbf_decrypt_file_desc((uint8_t *) cbf_file->name,
+					    name_len, key);
+	}
+	if (cbf_file->name[name_len -1] != '\0') {
+		cbf_file->name[name_len - 1] = '\0';
+		fprintf(stderr, "Ouha %u %s\n", name_len, cbf_file->name);
 	}
 
-	memcpy(cbf_file->name, data->name, name_len);
-
-	cbf_file->offset    = data->file_offset;
-	cbf_file->size      = data->file_size;
-	cbf_file->comp_size = data->compressed_size;
-	cbf_file->encoding  = data->encoding;
+	cbf_file->offset    = file_desc->file_offset;
+	cbf_file->size      = file_desc->file_size;
+	cbf_file->comp_size = file_desc->compressed_size;
+	cbf_file->encoding  = file_desc->encoding;
 
 	return 0;
 }
 
 static int cbf_load_file_descs(cbf_t *cbf)
 {
-	struct CBF_File *data = NULL;
+	uint8_t *file_table = NULL;
+	cbf_file_t *cbf_file = NULL;
 	size_t total_size = cbf->h_size;
-	uint32_t read_size = 0;
+	size_t t_pos = 0u;
 	uint32_t file_cnt;
-	uint16_t prev_desc_size = 0;
-	uint16_t desc_size;
 
 	if (fseek(cbf->f, cbf->t_offset, SEEK_SET) == -1) {
 		fprintf(stderr, "Unable to move file cursor\n");
 		return 1;
+	} else if ((file_table = (uint8_t *) malloc(cbf->t_size)) == NULL) {
+		fprintf(stderr, "Unable to alloc mem for file table\n");
+		return 1;
+	} else if (fread(file_table, cbf->t_size, 1, cbf->f) != 1) {
+		fprintf(stderr, "Unable to read file table\n");
+		free(file_table);
+		return 1;
 	}
 
 	for (file_cnt = 0; file_cnt < cbf->file_num; file_cnt++) {
-		cbf_file_t *cbf_file = &cbf->file_descs[file_cnt];
+		cbf_file = &cbf->file_descs[file_cnt];
+		cbf_file->cbf = cbf;
 
-		if ((fread(&desc_size, sizeof(desc_size), 1, cbf->f)) != 1) {
-			fprintf(stderr, "Unable to read file desc size\n");
+		if (cbf_parse_file_desc(cbf_file, file_table, cbf->t_size,
+				      &t_pos))
 			break;
-		}
-		read_size += sizeof(desc_size);
-
-		if (desc_size <= sizeof(struct CBF_File)) {
-			fprintf(stderr, "Invalid file desc size\n");
-			break;
-		}
-
-		if (prev_desc_size < desc_size || data == NULL) {
-			data = (struct CBF_File *) realloc(data, desc_size);
-			if (data == NULL) {
-				fprintf(stderr, "Unable to realloc memory\n");
-				break;
-			}
-			prev_desc_size = desc_size;
-		}
-
-		if ((fread(data, desc_size, 1, cbf->f)) != 1) {
-			fprintf(stderr, "Unable to read file desc\n");
-			break;
-		}
-		read_size += desc_size;
-
-		if (cbf_parse_file_desc(cbf_file, data, desc_size))
-			break;
-
-		if (cbf->mode == CBF_MOD_CLASSIC &&
-		    (data->unk1 != 0 || data->date_low != 0 ||
-		    data->date_high != 0)) {
-			fprintf(stderr, "Found non-zero reserved fields\n");
-		}
 
 		total_size += (cbf_file->encoding) ? cbf_file->comp_size :
 						     cbf_file->size;
-		cbf_file->cbf = cbf;
 	}
-	total_size += read_size;
+	total_size += cbf_file->cbf->t_size;
 
 	if (file_cnt != cbf->file_num) {
 		fprintf(stderr, "Found only %u/%u valid file descriptors\n",
 			file_cnt, cbf->file_num);
 		cbf->file_num = file_cnt;
-	}
-	else if (read_size != cbf->t_size) {
-		fprintf(stderr, "Incorrect file descriptor table size\n");
 	} else if (total_size != cbf->a_size) {
 		fprintf(stderr, "Incorrect archive size\n");
 	}
 
-	if (data)
-		free(data);
+	free(file_table);
 
 	return 0;
 }
@@ -450,7 +500,7 @@ cbf_file_t *cbf_fopen_index(cbf_t *cbf, uint32_t index)
 	file = &cbf->file_descs[index];
 	file->cur_ptr = 0u;
 
-	return (file->encoding == CBF_ENC_ENCRYPTION) ? file : NULL;
+	return (file->encoding == CBF_ENC_NOCOMPRESS) ? file : NULL;
 }
 
 size_t cbf_fread(void *ptr, size_t bytes, cbf_file_t *file)
@@ -472,7 +522,7 @@ size_t cbf_fread(void *ptr, size_t bytes, cbf_file_t *file)
 	ret = fread(ptr, 1, (bytes > bytes_max) ? bytes_max : bytes, cbf->f);
 	file->cur_ptr += ret;
 
-	if (file->encoding == CBF_ENC_ENCRYPTION)
+	if (cbf->ver == CBF_VER_ZBL1 && file->encoding == CBF_ENC_NOCOMPRESS)
 		cbf_decrypt_file((uint8_t *) ptr, ret, file->size);
 
 	return ret;

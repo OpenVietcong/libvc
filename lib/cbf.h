@@ -18,8 +18,13 @@ extern "C" {
 struct cbf;
 struct cbf_file;
 
+struct cbf_stat {
+	time_t mtime;
+};
+
 typedef struct cbf cbf_t;
 typedef struct cbf_file cbf_file_t;
+typedef struct cbf_stat cbf_stat_t;
 
 cbf_t *cbf_open(const char *path);
 void   cbf_close(cbf_t *cbf);
